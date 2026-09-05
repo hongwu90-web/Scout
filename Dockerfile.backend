@@ -1,0 +1,25 @@
+# Multi-stage Dockerfile to build and run Go backend without host Go dependency
+FROM golang:1.23-alpine AS builder
+WORKDIR /app
+# Copy dependency manifests
+COPY backend/go.mod backend/go.sum ./
+RUN go mod download
+# Copy code files
+COPY backend/ ./
+# Build binary
+RUN CGO_ENABLED=0 GOOS=linux go build -o fusion ./cmd/fusion/main.go
+
+FROM alpine:3.21.0
+RUN addgroup -S fusion && adduser -S -D -H -h /fusion -G fusion fusion && \
+    mkdir -p /data && chown -R fusion:fusion /data
+WORKDIR /fusion
+COPY --from=builder /app/fusion ./fusion
+EXPOSE 8080
+VOLUME ["/data"]
+
+# Port and config
+ENV FUSION_PORT=8080
+ENV FUSION_DB_PATH=/data/fusion.db
+ENV FUSION_PASSWORD=changeme
+
+CMD [ "./fusion" ]

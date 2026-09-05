@@ -1,0 +1,461 @@
+package feedbuilder
+
+import (
+	"bytes"
+	"context"
+	"encoding/xml"
+	"fmt"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/0x2E/fusion/internal/pkg/httpc"
+	"github.com/PuerkitoBio/goquery"
+)
+
+type BuiltItem struct {
+	Title       string `json:"title"`
+	Link        string `json:"link"`
+	Description string `json:"description"`
+	PubDate     string `json:"pub_date"`
+}
+
+type SelectorSuggestion struct {
+	Selector string `json:"selector"`
+	Count    int    `json:"count"`
+	Sample   string `json:"sample"`
+}
+
+type BuildPreviewResponse struct {
+	PageTitle          string               `json:"page_title"`
+	PageURL            string               `json:"page_url"`
+	SelectorUsed       string               `json:"selector_used"`
+	ItemsCount         int                  `json:"items_count"`
+	Items              []BuiltItem          `json:"items"`
+	SyntheticURL       string               `json:"synthetic_url"`
+	SuggestedSelectors []SelectorSuggestion `json:"suggested_selectors,omitempty"`
+}
+
+// RSS 2.0 XML Structures
+type rss2 struct {
+	XMLName xml.Name   `xml:"rss"`
+	Version string     `xml:"version,attr"`
+	Channel rssChannel `xml:"channel"`
+}
+
+type rssChannel struct {
+	Title         string    `xml:"title"`
+	Link          string    `xml:"link"`
+	Description   string    `xml:"description"`
+	Generator     string    `xml:"generator"`
+	LastBuildDate string    `xml:"lastBuildDate"`
+	Items         []rssItem `xml:"item"`
+}
+
+type rssItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description,omitempty"`
+	PubDate     string `xml:"pubDate"`
+	GUID        string `xml:"guid"`
+}
+
+var candidateSelectors = []string{
+	"article",
+	".article",
+	".post",
+	".entry",
+	".news-item",
+	".news-card",
+	".story",
+	".item",
+	"main ul > li",
+	"section ul > li",
+	".content-list > div",
+}
+
+// BuildRSSFromWebpage extracts article items from a webpage and returns the generated RSS XML.
+func BuildRSSFromWebpage(ctx context.Context, targetURL, userSelector string, allowPrivate bool) ([]byte, *BuildPreviewResponse, error) {
+	rawTarget := strings.TrimSpace(targetURL)
+	if rawTarget == "" {
+		return nil, nil, fmt.Errorf("empty url")
+	}
+
+	if !strings.HasPrefix(rawTarget, "http://") && !strings.HasPrefix(rawTarget, "https://") {
+		rawTarget = "https://" + rawTarget
+	}
+
+	parsedURL, err := url.Parse(rawTarget)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid url: %w", err)
+	}
+
+	client, err := httpc.NewClient(20*time.Second, "", allowPrivate)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create client: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawTarget, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create request: %w", err)
+	}
+	httpc.SetDefaultHeaders(req)
+
+	payload, err := httpc.DoWithFallback(ctx, client, req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch page: %w", err)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(payload.Body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse html: %w", err)
+	}
+
+	return BuildRSSFromHTML(doc, parsedURL, rawTarget, userSelector)
+}
+
+// BuildRSSFromHTML generates RSS XML and preview directly from a parsed HTML document.
+func BuildRSSFromHTML(doc *goquery.Document, parsedURL *url.URL, rawTarget string, userSelector string) ([]byte, *BuildPreviewResponse, error) {
+	// Clean out scripts and styles
+	doc.Find("script, style, noscript, svg, nav, footer, header").Remove()
+
+	pageTitle := strings.TrimSpace(doc.Find("title").Text())
+	if pageTitle == "" {
+		pageTitle = parsedURL.Hostname()
+	}
+
+	// Detect 3-4 candidate selectors from webpage structure
+	suggestedSelectors := DetectCandidateSelectors(doc, parsedURL)
+
+	var items []BuiltItem
+	selectorUsed := strings.TrimSpace(userSelector)
+
+	if selectorUsed != "" {
+		items = extractItemsWithSelector(doc, parsedURL, selectorUsed)
+	} else {
+		// Auto-detection: use top suggested selector if found
+		if len(suggestedSelectors) > 0 {
+			selectorUsed = suggestedSelectors[0].Selector
+			items = extractItemsWithSelector(doc, parsedURL, selectorUsed)
+		} else {
+			// Auto-detection: try candidate selectors
+			for _, sel := range candidateSelectors {
+				detected := extractItemsWithSelector(doc, parsedURL, sel)
+				if len(detected) >= 2 {
+					items = detected
+					selectorUsed = sel
+					break
+				}
+			}
+		}
+
+		// Fallback: look for any elements containing headings with links
+		if len(items) == 0 {
+			items = extractHeuristicItems(doc, parsedURL)
+			if len(items) > 0 {
+				selectorUsed = "h2, h3, h4 with links"
+			}
+		}
+	}
+
+	if len(items) == 0 {
+		return nil, nil, fmt.Errorf("could not detect articles on page. Try specifying a custom CSS selector")
+	}
+
+	// Generate RSS 2.0 XML
+	nowRFC := time.Now().Format(time.RFC1123Z)
+	rssFeed := rss2{
+		Version: "2.0",
+		Channel: rssChannel{
+			Title:         fmt.Sprintf("%s (Scout Feed)", pageTitle),
+			Link:          rawTarget,
+			Description:   fmt.Sprintf("Dynamic RSS feed generated by Scout Feed Builder for %s", rawTarget),
+			Generator:     "Scout RSS Builder",
+			LastBuildDate: nowRFC,
+			Items:         make([]rssItem, 0, len(items)),
+		},
+	}
+
+	for _, it := range items {
+		rssFeed.Channel.Items = append(rssFeed.Channel.Items, rssItem{
+			Title:       it.Title,
+			Link:        it.Link,
+			Description: it.Description,
+			PubDate:     it.PubDate,
+			GUID:        it.Link,
+		})
+	}
+
+	xmlBytes, err := xml.MarshalIndent(rssFeed, "", "  ")
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate xml: %w", err)
+	}
+	xmlOutput := append([]byte(xml.Header), xmlBytes...)
+
+	syntheticURL := fmt.Sprintf("/api/feeds/synthetic?url=%s", url.QueryEscape(rawTarget))
+	if selectorUsed != "" {
+		syntheticURL += fmt.Sprintf("&selector=%s", url.QueryEscape(selectorUsed))
+	}
+
+	preview := &BuildPreviewResponse{
+		PageTitle:          pageTitle,
+		PageURL:            rawTarget,
+		SelectorUsed:       selectorUsed,
+		ItemsCount:         len(items),
+		Items:              items,
+		SyntheticURL:       syntheticURL,
+		SuggestedSelectors: suggestedSelectors,
+	}
+
+	return xmlOutput, preview, nil
+}
+
+func extractItemsWithSelector(doc *goquery.Document, base *url.URL, selector string) []BuiltItem {
+	var items []BuiltItem
+	seenLinks := make(map[string]struct{})
+
+	doc.Find(selector).Each(func(_ int, s *goquery.Selection) {
+		title := ""
+		link := ""
+
+		// 1. Try finding heading inside item
+		heading := s.Find("h1, h2, h3, h4, h5, h6, .title, a.title").First()
+		if heading.Length() > 0 {
+			title = strings.TrimSpace(heading.Text())
+			if a := heading.Find("a[href]").First(); a.Length() > 0 {
+				link = a.AttrOr("href", "")
+			} else if heading.Is("a[href]") {
+				link = heading.AttrOr("href", "")
+			}
+		}
+
+		// 2. If no link yet, find first anchor or check if s itself is an anchor
+		if link == "" {
+			if s.Is("a[href]") {
+				link = s.AttrOr("href", "")
+				if title == "" {
+					title = strings.TrimSpace(s.Text())
+				}
+			} else if a := s.Find("a[href]").First(); a.Length() > 0 {
+				link = a.AttrOr("href", "")
+				if title == "" {
+					title = strings.TrimSpace(a.Text())
+				}
+			}
+		}
+
+		resolvedLink := resolveLink(base, link)
+		if resolvedLink == "" || title == "" || len(title) < 4 {
+			return
+		}
+
+		if _, exists := seenLinks[resolvedLink]; exists {
+			return
+		}
+		seenLinks[resolvedLink] = struct{}{}
+
+		// 3. Extract description
+		desc := strings.TrimSpace(s.Find("p, .desc, .summary, .excerpt, .snippet").First().Text())
+		if len(desc) > 300 {
+			desc = desc[:297] + "..."
+		}
+
+		// 4. Extract date
+		pubDate := ""
+		timeTag := s.Find("time").First()
+		if timeTag.Length() > 0 {
+			pubDate = timeTag.AttrOr("datetime", "")
+			if pubDate == "" {
+				pubDate = strings.TrimSpace(timeTag.Text())
+			}
+		}
+		if pubDate == "" {
+			pubDate = time.Now().Format(time.RFC1123Z)
+		}
+
+		items = append(items, BuiltItem{
+			Title:       title,
+			Link:        resolvedLink,
+			Description: desc,
+			PubDate:     pubDate,
+		})
+	})
+
+	return items
+}
+
+func extractHeuristicItems(doc *goquery.Document, base *url.URL) []BuiltItem {
+	var items []BuiltItem
+	seenLinks := make(map[string]struct{})
+
+	doc.Find("h2, h3, h4").Each(func(_ int, s *goquery.Selection) {
+		a := s.Find("a[href]").First()
+		if a.Length() == 0 {
+			// Check parent or sibling
+			if parentA := s.ParentsFiltered("a[href]").First(); parentA.Length() > 0 {
+				a = parentA
+			}
+		}
+		if a.Length() == 0 {
+			return
+		}
+
+		title := strings.TrimSpace(s.Text())
+		link := a.AttrOr("href", "")
+		resolved := resolveLink(base, link)
+		if resolved == "" || len(title) < 5 {
+			return
+		}
+
+		if _, exists := seenLinks[resolved]; exists {
+			return
+		}
+		seenLinks[resolved] = struct{}{}
+
+		items = append(items, BuiltItem{
+			Title:       title,
+			Link:        resolved,
+			Description: "",
+			PubDate:     time.Now().Format(time.RFC1123Z),
+		})
+	})
+
+	return items
+}
+
+func resolveLink(base *url.URL, ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" || strings.HasPrefix(ref, "javascript:") || strings.HasPrefix(ref, "#") {
+		return ""
+	}
+	parsed, err := url.Parse(ref)
+	if err != nil {
+		return ""
+	}
+	resolved := base.ResolveReference(parsed)
+	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+		return ""
+	}
+	return resolved.String()
+}
+
+// DetectCandidateSelectors analyzes the document structure and returns 3-4 top repeating candidate selectors with element counts and sample headline text.
+func DetectCandidateSelectors(doc *goquery.Document, base *url.URL) []SelectorSuggestion {
+	// 1. Predefined common repeating container selectors
+	candidateList := []string{
+		"article",
+		".article",
+		"dl dd",
+		"ul > li",
+		".news-item",
+		".news-card",
+		".post",
+		".entry",
+		".story",
+		".card",
+		"dd",
+		"li",
+		"main ul > li",
+		"section ul > li",
+		".content li",
+		".list li",
+		".feed-item",
+		".content-list > div",
+		"div[class*='article']",
+		"div[class*='story']",
+		"div[class*='post']",
+		"div[class*='card']",
+		"div[class*='news']",
+		"div[class*='item']",
+	}
+
+	// 2. Discover dynamic classes from parents or grandparents of headings or story-like links
+	doc.Find("h1 a[href], h2 a[href], h3 a[href], h4 a[href], p a[href], a[href]").Each(func(_ int, a *goquery.Selection) {
+		txt := strings.TrimSpace(a.Text())
+		if len(txt) < 18 {
+			return
+		}
+		parent := a.Parent()
+		grandparent := parent.Parent()
+		for _, elem := range []*goquery.Selection{parent, grandparent} {
+			if classAttr, exists := elem.Attr("class"); exists {
+				for _, cls := range strings.Fields(classAttr) {
+					cls = strings.TrimSpace(cls)
+					if len(cls) >= 3 && !strings.ContainsAny(cls, ":#.[],()>+") {
+						candidateList = append(candidateList, "."+cls)
+					}
+				}
+			}
+		}
+	})
+
+	// 3. Deduplicate candidate strings
+	seenSelectors := make(map[string]bool)
+	var uniqueSelectors []string
+	for _, sel := range candidateList {
+		sel = strings.TrimSpace(sel)
+		if sel == "" || seenSelectors[sel] {
+			continue
+		}
+		seenSelectors[sel] = true
+		uniqueSelectors = append(uniqueSelectors, sel)
+	}
+
+	// 4. Test each selector and measure its quality
+	type scoredSelector struct {
+		suggestion  SelectorSuggestion
+		fingerprint string
+	}
+	var scored []scoredSelector
+	seenFingerprints := make(map[string]bool)
+
+	for _, sel := range uniqueSelectors {
+		items := extractItemsWithSelector(doc, base, sel)
+		if len(items) < 2 {
+			continue
+		}
+
+		// Fingerprint based on the first 2 item links to avoid identical duplicates
+		fingerprint := ""
+		for i := 0; i < len(items) && i < 2; i++ {
+			fingerprint += items[i].Link + "|"
+		}
+		if seenFingerprints[fingerprint] {
+			continue
+		}
+		seenFingerprints[fingerprint] = true
+
+		sampleTitle := items[0].Title
+		if len(sampleTitle) > 70 {
+			sampleTitle = sampleTitle[:67] + "..."
+		}
+
+		scored = append(scored, scoredSelector{
+			suggestion: SelectorSuggestion{
+				Selector: sel,
+				Count:    len(items),
+				Sample:   sampleTitle,
+			},
+			fingerprint: fingerprint,
+		})
+	}
+
+	// 5. Sort candidate selectors by item count descending, favoring simpler standard selectors when counts match
+	sort.SliceStable(scored, func(i, j int) bool {
+		c1, c2 := scored[i].suggestion.Count, scored[j].suggestion.Count
+		if c1 != c2 {
+			return c1 > c2
+		}
+		return len(scored[i].suggestion.Selector) < len(scored[j].suggestion.Selector)
+	})
+
+	// 6. Return top 4 distinct candidate suggestions
+	var results []SelectorSuggestion
+	for i := 0; i < len(scored) && i < 4; i++ {
+		results = append(results, scored[i].suggestion)
+	}
+
+	return results
+}

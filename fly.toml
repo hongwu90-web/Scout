@@ -1,0 +1,30 @@
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = "{APP_NAME}"
+
+# https://fly.io/docs/reference/regions/#fly-io-regions
+primary_region = "{REGION}"
+
+[build]
+image = 'ghcr.io/0x2e/fusion:latest'
+
+[http_service]
+internal_port = 8080
+force_https = true
+auto_stop_machines = "off"
+auto_start_machines = false
+
+[[vm]]
+size = 'shared-cpu-1x'
+memory = '256mb'
+
+[env]
+FUSION_PASSWORD = "{YOUR_PASSWORD}"
+FUSION_HOST = "127.0.0.1"
+FUSION_DB_PATH = "/data/fusion.db"
+
+[mounts]
+source = "fusion_data"
+destination = "/data"
+initial_size = "1GB"
