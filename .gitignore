@@ -11,8 +11,10 @@ backend/internal/web/dist/*
 
 node_modules/
 .module-cache/
-scout
-fusion
+/scout
+/fusion
+/backend/fusion
+/backend/scout
 *.exe
 *.zip
 

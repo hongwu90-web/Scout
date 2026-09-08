@@ -31,6 +31,7 @@ export async function scrapePage(
       method: "GET",
       headers,
       redirect: "follow",
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!response.ok) {
@@ -44,7 +45,10 @@ export async function scrapePage(
       };
     }
 
-    const html = await response.text();
+    let html = await response.text();
+    if (html.length > 1_500_000) {
+      html = html.slice(0, 1_500_000);
+    }
     const $ = cheerio.load(html);
 
     // Strip default non-content boilerplate

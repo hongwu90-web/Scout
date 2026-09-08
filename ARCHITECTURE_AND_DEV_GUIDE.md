@@ -1,6 +1,6 @@
 # 🛰️ SCOUT — App Architecture & Developer Guide
 
-Welcome to the official developer guide for **SCOUT**. 
+Welcome to the official developer guide for **SCOUT** (00 / SCOUT). 
 
 This guide is designed for **everyone** — whether you are a non-coder, a designer, a junior developer, or an experienced engineer. It breaks down the entire system architecture in plain English, explains how every folder and file works, provides step-by-step instructions for running the local environment, and shows you exactly how to add or update features.
 
@@ -308,4 +308,4 @@ When editing or updating the layout, **always follow these user-defined guidelin
 
 ---
 
-*Documentation maintained for **SCOUT**.*
+*Documentation maintained for **SCOUT (00 / SCOUT)**.*

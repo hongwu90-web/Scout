@@ -411,6 +411,14 @@ func (h *Handler) refreshAllFeeds(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), refreshAllTimeout)
 		defer cancel()
 
+		if h.puller.GetCloudFeedSync() != nil && h.puller.GetCloudFeedSync().IsEnabled() {
+			if imported, err := h.puller.GetCloudFeedSync().FullSync(ctx, 1); err != nil {
+				slog.Warn("cloud feed sync failed during refresh-all", "error", err)
+			} else if imported > 0 {
+				slog.Info("imported offline cloud feed items during refresh-all", "count", imported)
+			}
+		}
+
 		if count, err := h.puller.RefreshAll(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			slog.Warn("refresh all feeds failed", "refreshed", count, "error", err)
 		}

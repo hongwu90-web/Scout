@@ -104,16 +104,25 @@ app.use("/api/*", async (c, next) => {
 app.get("/health", async (c) => {
   try {
     const pageCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM monitored_pages").first<{ cnt: number }>();
+    const activePageCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM monitored_pages WHERE is_active = 1").first<{ cnt: number }>();
     const snapCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM page_snapshots").first<{ cnt: number }>();
     const feedCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM cloud_feeds").first<{ cnt: number }>();
-    const itemCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM cloud_feed_items").first<{ cnt: number }>();
+    const activeFeedCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM cloud_feeds WHERE is_active = 1").first<{ cnt: number }>();
+    const itemCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt, MAX(id) as max_id, MAX(created_at) as max_created FROM cloud_feed_items").first<{ cnt: number; max_id: number; max_created: number }>();
+    const oldestFeed = await c.env.DB.prepare("SELECT MIN(last_checked_at) as min_checked FROM cloud_feeds WHERE is_active = 1").first<{ min_checked: number }>();
+
     return c.json({
       status: "ok",
       server_time: Math.floor(Date.now() / 1000),
       monitored_pages_count: pageCount?.cnt ?? 0,
+      active_monitored_pages_count: activePageCount?.cnt ?? 0,
       snapshots_count: snapCount?.cnt ?? 0,
       feeds_count: feedCount?.cnt ?? 0,
+      active_feeds_count: activeFeedCount?.cnt ?? 0,
       feed_items_count: itemCount?.cnt ?? 0,
+      latest_feed_item_id: itemCount?.max_id ?? 0,
+      latest_feed_item_at: itemCount?.max_created ?? 0,
+      oldest_feed_checked_at: oldestFeed?.min_checked ?? 0,
     });
   } catch (err: any) {
     return c.json({ status: "warning", message: "Database tables query warning", error: err.message });
@@ -155,6 +164,18 @@ app.post("/api/sync/push", async (c) => {
 
   const now = Math.floor(Date.now() / 1000);
   const statements: D1PreparedStatement[] = [];
+  const incomingIds = (body.monitors || []).map((m) => m.id);
+
+  if (incomingIds.length > 0) {
+    const placeholders = incomingIds.map(() => "?").join(",");
+    statements.push(
+      c.env.DB.prepare(`UPDATE monitored_pages SET is_active = 0 WHERE id NOT IN (${placeholders})`).bind(...incomingIds)
+    );
+  } else {
+    statements.push(
+      c.env.DB.prepare(`UPDATE monitored_pages SET is_active = 0`)
+    );
+  }
 
   for (const m of body.monitors || []) {
     const checkInterval = m.check_interval && m.check_interval > 0 ? m.check_interval : 3600;
@@ -292,6 +313,40 @@ app.get("/api/sync/feeds/pull", async (c) => {
   });
 });
 
+// Manual cron trigger for testing and administrative diagnostics
+app.all("/api/sync/cron/run", async (c) => {
+  const start = Date.now();
+  try {
+    await handleScheduled(c.env);
+    const duration = Date.now() - start;
+
+    const latestFeeds = await c.env.DB.prepare(
+      "SELECT id, name, last_checked_at, datetime(last_checked_at, 'unixepoch') as checked_dt FROM cloud_feeds WHERE is_active = 1 ORDER BY last_checked_at DESC LIMIT 10"
+    ).all();
+    const stats = await c.env.DB.prepare(
+      "SELECT COUNT(*) as cnt, MAX(id) as max_id, MAX(created_at) as max_created FROM cloud_feed_items"
+    ).first();
+    const pages = await c.env.DB.prepare(
+      "SELECT id, name, last_status, last_error, next_check_at, datetime(next_check_at, 'unixepoch') as next_dt FROM monitored_pages WHERE is_active = 1"
+    ).all();
+
+    return c.json({
+      status: "ok",
+      duration_ms: duration,
+      recent_checked_feeds: latestFeeds.results,
+      items_meta: stats,
+      active_monitored_pages: pages.results,
+    });
+  } catch (err: any) {
+    return c.json({
+      status: "error",
+      error: err?.message || String(err),
+      stack: err?.stack,
+      duration_ms: Date.now() - start,
+    }, 500);
+  }
+});
+
 // ---------------------- SCHEDULED CRON ENGINE (24/7) ----------------------
 
 async function handleScheduled(env: Env) {
@@ -308,7 +363,7 @@ async function handleScheduled(env: Env) {
 async function checkDueMonitoredPages(env: Env, now: number) {
   try {
     const { results: duePages } = await env.DB.prepare(
-      `SELECT * FROM monitored_pages WHERE is_active = 1 AND next_check_at <= ? ORDER BY next_check_at ASC LIMIT 10`
+      `SELECT * FROM monitored_pages WHERE is_active = 1 AND next_check_at <= ? ORDER BY next_check_at ASC LIMIT 4`
     )
       .bind(now)
       .all<MonitoredPageRow>();
@@ -319,8 +374,15 @@ async function checkDueMonitoredPages(env: Env, now: number) {
     for (const page of duePages) {
       try {
         await checkSinglePage(env.DB, page);
-      } catch (err) {
-        console.error(`[Cron] Failed checking page ${page.id}:`, err);
+      } catch (err: any) {
+        console.error(`[Cron] Failed checking page ${page.id} (${page.name}):`, err);
+        try {
+          await env.DB.prepare(
+            `UPDATE monitored_pages SET next_check_at = ?, last_error = ? WHERE id = ?`
+          )
+            .bind(now + page.check_interval, String(err?.message || err), page.id)
+            .run();
+        } catch {}
       }
     }
   } catch (err) {
@@ -330,19 +392,19 @@ async function checkDueMonitoredPages(env: Env, now: number) {
 
 async function checkDueFeeds(env: Env, now: number) {
   try {
-    // Fetch active feeds (up to 30)
+    // Check up to 10 active feeds ordered by oldest check time
+    // 10 feeds every 5 minutes = 120 feeds checked per hour (rotates through 32 feeds every 16 minutes)
     const { results: activeFeeds } = await env.DB.prepare(
-      `SELECT * FROM cloud_feeds WHERE is_active = 1 ORDER BY last_checked_at ASC LIMIT 30`
+      `SELECT * FROM cloud_feeds WHERE is_active = 1 ORDER BY last_checked_at ASC LIMIT 10`
     ).all<CloudFeedRow>();
 
     if (!activeFeeds || activeFeeds.length === 0) return;
 
-    console.log(`[Cron] Fetching ${activeFeeds.length} active RSS feeds 24/7.`);
-
-    // Fetch in parallel chunks of 10
-    const chunkSize = 10;
-    for (let i = 0; i < activeFeeds.length; i += chunkSize) {
-      const chunk = activeFeeds.slice(i, i + chunkSize);
+    console.log(`[Cron] Fetching ${activeFeeds.length} active RSS feeds.`);
+    // Process in batches of 2 with concurrency to ensure zero worker CPU timeouts
+    const concurrency = 2;
+    for (let i = 0; i < activeFeeds.length; i += concurrency) {
+      const chunk = activeFeeds.slice(i, i + concurrency);
       await Promise.allSettled(chunk.map((feed) => fetchAndArchiveFeed(env.DB, feed, now)));
     }
   } catch (err) {
@@ -353,7 +415,7 @@ async function checkDueFeeds(env: Env, now: number) {
 async function fetchAndArchiveFeed(db: D1Database, feed: CloudFeedRow, now: number) {
   try {
     const headers: Record<string, string> = {
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Scout/1.20",
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Scout/1.32",
       "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
     };
 
@@ -366,7 +428,7 @@ async function fetchAndArchiveFeed(db: D1Database, feed: CloudFeedRow, now: numb
 
     const resp = await fetch(feed.link, {
       headers,
-      signal: AbortSignal.timeout(10000), // 10s timeout
+      signal: AbortSignal.timeout(8000), // 8s strict timeout
     });
 
     if (resp.status === 304) {
@@ -383,7 +445,10 @@ async function fetchAndArchiveFeed(db: D1Database, feed: CloudFeedRow, now: numb
 
     const etag = resp.headers.get("etag") || "";
     const lastModified = resp.headers.get("last-modified") || "";
-    const xmlText = await resp.text();
+    let xmlText = await resp.text();
+    if (xmlText.length > 2_000_000) {
+      xmlText = xmlText.slice(0, 2_000_000);
+    }
 
     const items = parseRSSOrAtom(xmlText);
     if (items.length === 0) {
@@ -394,9 +459,13 @@ async function fetchAndArchiveFeed(db: D1Database, feed: CloudFeedRow, now: numb
       return;
     }
 
+    // Limit to newest 40 items so giant feeds (e.g. 2,000 items) never blow memory or D1 limits
+    const itemsToSave = items.slice(0, 40);
+
     // Insert newly published items with ON CONFLICT DO NOTHING
     const insertStmts: D1PreparedStatement[] = [];
-    for (const item of items) {
+    for (const item of itemsToSave) {
+      const safeContent = item.content && item.content.length > 50000 ? item.content.slice(0, 50000) : (item.content || "");
       insertStmts.push(
         db.prepare(`
           INSERT INTO cloud_feed_items (
@@ -408,15 +477,20 @@ async function fetchAndArchiveFeed(db: D1Database, feed: CloudFeedRow, now: numb
           item.guid,
           item.title,
           item.link,
-          item.content,
+          safeContent,
           item.pubDate,
           now
         )
       );
     }
 
-    if (insertStmts.length > 0) {
-      await db.batch(insertStmts);
+    // Execute in small batches of 20 to strictly respect D1 statement limit
+    const batchSize = 20;
+    for (let i = 0; i < insertStmts.length; i += batchSize) {
+      const chunk = insertStmts.slice(i, i + batchSize);
+      if (chunk.length > 0) {
+        await db.batch(chunk);
+      }
     }
 
     await db
@@ -424,10 +498,12 @@ async function fetchAndArchiveFeed(db: D1Database, feed: CloudFeedRow, now: numb
       .bind(now, etag, lastModified, feed.id)
       .run();
 
-    console.log(`[Cron] Feed ${feed.name} parsed: ${items.length} items processed.`);
+    console.log(`[Cron] Feed ${feed.name} parsed: ${itemsToSave.length} items processed.`);
   } catch (err) {
     console.error(`[Cron] Failed fetching feed ${feed.id} (${feed.name}):`, err);
-    await db.prepare("UPDATE cloud_feeds SET last_checked_at = ? WHERE id = ?").bind(now, feed.id).run();
+    try {
+      await db.prepare("UPDATE cloud_feeds SET last_checked_at = ? WHERE id = ?").bind(now, feed.id).run();
+    } catch {}
   }
 }
 

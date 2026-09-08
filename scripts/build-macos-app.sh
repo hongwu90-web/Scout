@@ -17,19 +17,7 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 echo "==> Building frontend..."
 (
   cd "$ROOT_DIR/frontend"
-  if [ ! -d "node_modules" ]; then
-    echo "==> Installing frontend dependencies..."
-    if command -v pnpm >/dev/null 2>&1; then
-      pnpm install --no-frozen-lockfile
-    else
-      npm ci || npm install
-    fi
-  fi
-  if command -v pnpm >/dev/null 2>&1; then
-    pnpm run build
-  else
-    npm run build
-  fi
+  npm run build
 )
 
 # 2. Sync web dist to backend
@@ -93,13 +81,13 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <key>CFBundleIdentifier</key>
     <string>com.scout.app</string>
     <key>CFBundleName</key>
-    <string>Scout v1.40</string>
+    <string>Scout v1.45</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.40</string>
+    <string>1.45</string>
     <key>CFBundleVersion</key>
-    <string>1.40</string>
+    <string>1.45</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
@@ -117,13 +105,13 @@ chmod +x "$MACOS_DIR/Scout"
 echo "==> Creating Zip archive for easy distribution..."
 (
   cd "$DIST_DIR"
-  rm -f Scout-macOS-arm64.zip Scout-v1.40-macOS-arm64.zip Scout-v1.33-macOS-arm64.zip Scout-v1.32-macOS-arm64.zip Scout-v1.31-macOS-arm64.zip Scout-v1.30-macOS-arm64.zip Scout-v1.20-macOS-arm64.zip
-  zip -r -q Scout-v1.40-macOS-arm64.zip "$APP_NAME.app"
-  cp Scout-v1.40-macOS-arm64.zip Scout-macOS-arm64.zip
+  rm -f Scout-macOS-arm64.zip Scout-v1.45-macOS-arm64.zip Scout-v1.40-macOS-arm64.zip Scout-v1.33-macOS-arm64.zip Scout-v1.32-macOS-arm64.zip Scout-v1.31-macOS-arm64.zip Scout-v1.30-macOS-arm64.zip Scout-v1.20-macOS-arm64.zip
+  zip -r -q Scout-v1.45-macOS-arm64.zip "$APP_NAME.app"
+  cp Scout-v1.45-macOS-arm64.zip Scout-macOS-arm64.zip
 )
 
 echo "==> Done! Application bundle created at: $APP_DIR"
-echo "==> Zip archive created at: $DIST_DIR/Scout-v1.40-macOS-arm64.zip"
+echo "==> Zip archive created at: $DIST_DIR/Scout-v1.45-macOS-arm64.zip"
 
 if [ "${1:-}" = "--install" ] || [ "${INSTALL_APP:-0}" = "1" ]; then
   if [ -d "/Applications" ]; then
