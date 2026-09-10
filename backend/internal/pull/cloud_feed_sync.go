@@ -141,6 +141,15 @@ func (c *CloudFeedSync) PullOfflineFeedItems(ctx context.Context, userID int64) 
 	currentCursor := lastID
 	batchLimit := 1000
 
+	localFeeds, err := c.store.ListFeeds(userID)
+	if err != nil {
+		return 0, fmt.Errorf("list local feeds: %w", err)
+	}
+	validFeedIDs := make(map[int64]bool, len(localFeeds))
+	for _, f := range localFeeds {
+		validFeedIDs[f.ID] = true
+	}
+
 	for {
 		url := fmt.Sprintf("%s/api/sync/feeds/pull?since_id=%d&limit=%d", c.cfg.CloudMonitorURL, currentCursor, batchLimit)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -194,6 +203,10 @@ func (c *CloudFeedSync) PullOfflineFeedItems(ctx context.Context, userID int64) 
 		}
 
 		for feedID, inputs := range grouped {
+			if !validFeedIDs[feedID] {
+				slog.Debug("skipping cloud items for feed no longer present locally", "feed_id", feedID, "count", len(inputs))
+				continue
+			}
 			inserted, err := c.store.BatchCreateItemsIgnore(userID, feedID, inputs)
 			if err != nil {
 				slog.Warn("failed to insert cloud feed items", "feed_id", feedID, "error", err)

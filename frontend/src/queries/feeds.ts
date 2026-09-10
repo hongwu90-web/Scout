@@ -144,6 +144,8 @@ export function useRefreshFeeds() {
     mutationFn: () => feedAPI.refresh(),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: queryKeys.feeds.all });
+      qc.invalidateQueries({ queryKey: queryKeys.focusFeeds.all });
+      qc.invalidateQueries({ queryKey: queryKeys.groups.all });
       qc.invalidateQueries({ queryKey: queryKeys.items.all });
     },
   });

@@ -404,27 +404,37 @@ func (h *Handler) refreshAllFeeds(c *gin.Context) {
 		return
 	}
 
-	// Run in background so the HTTP response returns immediately.
+	userID := getUserID(c)
+
+	// Step 1: Perform fast Cloudflare sync synchronously (150-300ms)
+	// so offline articles buffered by Cloudflare D1 are already saved in SQLite
+	// before the frontend receives the HTTP response and invalidates query caches.
+	imported := 0
+	if h.puller.GetCloudFeedSync() != nil && h.puller.GetCloudFeedSync().IsEnabled() {
+		syncCtx, syncCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+		var syncErr error
+		imported, syncErr = h.puller.GetCloudFeedSync().FullSync(syncCtx, userID)
+		syncCancel()
+		if syncErr != nil {
+			slog.Warn("cloud feed sync failed during refresh-all", "error", syncErr)
+		} else if imported > 0 {
+			slog.Info("imported offline cloud feed items during refresh-all", "count", imported)
+		}
+	}
+
+	// Step 2: Run direct local feed scraping in background so long network timeouts do not block the user.
 	go func() {
 		defer h.finishRefreshAll()
 
 		ctx, cancel := context.WithTimeout(context.Background(), refreshAllTimeout)
 		defer cancel()
 
-		if h.puller.GetCloudFeedSync() != nil && h.puller.GetCloudFeedSync().IsEnabled() {
-			if imported, err := h.puller.GetCloudFeedSync().FullSync(ctx, 1); err != nil {
-				slog.Warn("cloud feed sync failed during refresh-all", "error", err)
-			} else if imported > 0 {
-				slog.Info("imported offline cloud feed items during refresh-all", "count", imported)
-			}
-		}
-
 		if count, err := h.puller.RefreshAll(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			slog.Warn("refresh all feeds failed", "refreshed", count, "error", err)
 		}
 	}()
 
-	c.Status(http.StatusAccepted)
+	dataResponse(c, gin.H{"imported": imported})
 }
 
 func (h *Handler) tryStartRefreshAll() bool {

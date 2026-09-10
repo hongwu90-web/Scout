@@ -68,6 +68,11 @@ interface CloudFeedItemRow {
 
 const app = new Hono<{ Bindings: Env }>();
 
+app.onError((err, c) => {
+  console.error("Scout Cloud Monitor Error:", err);
+  return c.json({ error: err.message, stack: err.stack }, 500);
+});
+
 app.use("*", cors());
 
 // Constant-time string comparison to prevent side-channel timing attacks
@@ -246,6 +251,10 @@ app.post("/api/sync/feeds/push", async (c) => {
 
   for (const f of body.feeds || []) {
     const isActive = f.is_active !== false ? 1 : 0;
+    // Remove any stale feed entries holding this link under an older/different ID
+    statements.push(
+      c.env.DB.prepare(`DELETE FROM cloud_feeds WHERE link = ? AND id != ?`).bind(f.link, f.id)
+    );
     statements.push(
       c.env.DB.prepare(`
         INSERT INTO cloud_feeds (
@@ -353,17 +362,20 @@ async function handleScheduled(env: Env) {
   const now = Math.floor(Date.now() / 1000);
   console.log(`[Cron] Starting 24/7 background sync cycle at epoch ${now}`);
 
-  await Promise.allSettled([
-    checkDueMonitoredPages(env, now),
-    checkDueFeeds(env, now),
-    pruneOldData(env.DB, now),
-  ]);
+  // Run sequentially to strictly respect Cloudflare Workers 10ms CPU limit
+  await checkDueMonitoredPages(env, now);
+  await checkDueFeeds(env, now);
+
+  // Prune expired buffer data once per hour
+  if (now % 3600 < 300) {
+    await pruneOldData(env.DB, now);
+  }
 }
 
 async function checkDueMonitoredPages(env: Env, now: number) {
   try {
     const { results: duePages } = await env.DB.prepare(
-      `SELECT * FROM monitored_pages WHERE is_active = 1 AND next_check_at <= ? ORDER BY next_check_at ASC LIMIT 4`
+      `SELECT * FROM monitored_pages WHERE is_active = 1 AND next_check_at <= ? ORDER BY next_check_at ASC LIMIT 2`
     )
       .bind(now)
       .all<MonitoredPageRow>();
@@ -392,10 +404,10 @@ async function checkDueMonitoredPages(env: Env, now: number) {
 
 async function checkDueFeeds(env: Env, now: number) {
   try {
-    // Check up to 10 active feeds ordered by oldest check time
-    // 10 feeds every 5 minutes = 120 feeds checked per hour (rotates through 32 feeds every 16 minutes)
+    // Check 4 active feeds per 5-minute cron = 48 feeds checked/hour
+    // Fully cycles through 30 user feeds every ~37 minutes without CPU spikes
     const { results: activeFeeds } = await env.DB.prepare(
-      `SELECT * FROM cloud_feeds WHERE is_active = 1 ORDER BY last_checked_at ASC LIMIT 10`
+      `SELECT * FROM cloud_feeds WHERE is_active = 1 ORDER BY last_checked_at ASC LIMIT 4`
     ).all<CloudFeedRow>();
 
     if (!activeFeeds || activeFeeds.length === 0) return;
@@ -607,6 +619,6 @@ async function checkSinglePage(db: D1Database, page: MonitoredPageRow) {
 export default {
   fetch: app.fetch,
   scheduled: async (event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
-    ctx.waitUntil(handleScheduled(env));
+    await handleScheduled(env);
   },
 };

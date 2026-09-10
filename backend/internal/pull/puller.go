@@ -66,7 +66,7 @@ func (p *Puller) Start(ctx context.Context) error {
 	var cloudTicker *time.Ticker
 	var cloudChan <-chan time.Time
 	if p.cloudSync != nil && p.cloudSync.IsEnabled() {
-		cloudTicker = time.NewTicker(15 * time.Minute)
+		cloudTicker = time.NewTicker(3 * time.Minute)
 		defer cloudTicker.Stop()
 		cloudChan = cloudTicker.C
 	}
