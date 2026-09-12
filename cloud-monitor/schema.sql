@@ -78,3 +78,17 @@ ON cloud_feed_items(created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_cloud_feed_items_feed 
 ON cloud_feed_items(feed_id, pub_date DESC);
 
+CREATE TABLE IF NOT EXISTS cloud_purged_items (
+    user_id INTEGER NOT NULL DEFAULT 1,
+    feed_id INTEGER NOT NULL,
+    guid TEXT NOT NULL,
+    purged_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, feed_id, guid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_purged_feed 
+ON cloud_purged_items(user_id, feed_id);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_purged_purged_at 
+ON cloud_purged_items(purged_at);
+

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/0x2E/fusion/internal/model"
 )
@@ -117,6 +118,13 @@ func (s *Store) GetItem(userID int64, id int64) (*model.Item, error) {
 }
 
 func (s *Store) CreateItem(userID int64, feedID int64, guid, title, link, content string, pubDate int64) (*model.Item, error) {
+	var purgedCount int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM purged_items WHERE user_id = :user_id AND feed_id = :feed_id AND guid = :guid",
+		sql.Named("user_id", userID), sql.Named("feed_id", feedID), sql.Named("guid", guid)).Scan(&purgedCount)
+	if err == nil && purgedCount > 0 {
+		return nil, fmt.Errorf("item was previously purged")
+	}
+
 	result, err := s.db.Exec(`
 		INSERT INTO items (user_id, feed_id, guid, title, link, content, pub_date)
 		VALUES (:user_id, :feed_id, :guid, :title, :link, :content, :pub_date)
@@ -142,7 +150,8 @@ type BatchCreateItemInput struct {
 	PubDate int64
 }
 
-// BatchCreateItemsIgnore inserts items in one transaction and ignores duplicates by (feed_id, guid).
+// BatchCreateItemsIgnore inserts items in one transaction and ignores duplicates by (feed_id, guid)
+// as well as items that have been previously purged.
 // Returns the number of newly inserted rows.
 func (s *Store) BatchCreateItemsIgnore(userID int64, feedID int64, inputs []BatchCreateItemInput) (int, error) {
 	if len(inputs) == 0 {
@@ -160,7 +169,11 @@ func (s *Store) BatchCreateItemsIgnore(userID int64, feedID int64, inputs []Batc
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO items (user_id, feed_id, guid, title, link, content, pub_date)
-		VALUES (:user_id, :feed_id, :guid, :title, :link, :content, :pub_date)
+		SELECT :user_id, :feed_id, :guid, :title, :link, :content, :pub_date
+		WHERE NOT EXISTS (
+			SELECT 1 FROM purged_items
+			WHERE user_id = :user_id AND feed_id = :feed_id AND guid = :guid
+		)
 		ON CONFLICT(user_id, feed_id, guid) DO NOTHING
 	`)
 	if err != nil {
@@ -589,24 +602,98 @@ func (s *Store) MarkItemsReadByDate(userID int64, feedID, groupID *int64, before
 	return err
 }
 
-// DeleteReadItems deletes all read items matching the given feed or group criteria.
-func (s *Store) DeleteReadItems(userID int64, feedID, groupID *int64) (int64, error) {
-	query := `DELETE FROM items WHERE unread = 0 AND user_id = :user_id`
+type PurgedItemRecord struct {
+	FeedID int64  `json:"feed_id"`
+	GUID   string `json:"guid"`
+}
+
+// DeleteReadItems deletes all read items matching the given feed or group criteria
+// and records tombstones in purged_items so they are never re-ingested.
+func (s *Store) DeleteReadItems(userID int64, feedID, groupID *int64) (int64, []PurgedItemRecord, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.Rollback()
+
+	whereClause := "WHERE i.unread = 0 AND i.user_id = :user_id AND i.id NOT IN (SELECT item_id FROM bookmarks WHERE item_id IS NOT NULL AND user_id = :user_id)"
 	args := []any{sql.Named("user_id", userID)}
 
 	if groupID != nil {
-		query = `DELETE FROM items WHERE unread = 0 AND user_id = :user_id AND feed_id IN (SELECT id FROM feeds WHERE group_id = :group_id AND user_id = :user_id)`
+		whereClause += " AND i.feed_id IN (SELECT id FROM feeds WHERE group_id = :group_id AND user_id = :user_id)"
 		args = append(args, sql.Named("group_id", *groupID))
 	}
 
 	if feedID != nil {
-		query += ` AND feed_id = :feed_id`
+		whereClause += " AND i.feed_id = :feed_id"
 		args = append(args, sql.Named("feed_id", *feedID))
 	}
 
-	result, err := s.db.Exec(query, args...)
+	// 1. Collect items to be purged
+	rows, err := tx.Query("SELECT i.feed_id, i.guid FROM items i "+whereClause, args...)
 	if err != nil {
-		return 0, err
+		return 0, nil, fmt.Errorf("query items to purge: %w", err)
 	}
-	return result.RowsAffected()
+	var purged []PurgedItemRecord
+	for rows.Next() {
+		var rec PurgedItemRecord
+		if err := rows.Scan(&rec.FeedID, &rec.GUID); err != nil {
+			rows.Close()
+			return 0, nil, err
+		}
+		purged = append(purged, rec)
+	}
+	rows.Close()
+
+	if len(purged) == 0 {
+		return 0, nil, nil
+	}
+
+	// 2. Insert tombstones into purged_items
+	now := time.Now().Unix()
+	insertTombstoneStmt, err := tx.Prepare(`
+		INSERT OR IGNORE INTO purged_items (user_id, feed_id, guid, purged_at)
+		VALUES (:user_id, :feed_id, :guid, :purged_at)
+	`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("prepare tombstone statement: %w", err)
+	}
+	defer insertTombstoneStmt.Close()
+
+	for _, rec := range purged {
+		if _, err := insertTombstoneStmt.Exec(
+			sql.Named("user_id", userID),
+			sql.Named("feed_id", rec.FeedID),
+			sql.Named("guid", rec.GUID),
+			sql.Named("purged_at", now),
+		); err != nil {
+			return 0, nil, fmt.Errorf("insert tombstone: %w", err)
+		}
+	}
+
+	// 3. Delete matching read items from items table
+	deleteQuery := "DELETE FROM items WHERE id IN (SELECT i.id FROM items i " + whereClause + ")"
+	delRes, err := tx.Exec(deleteQuery, args...)
+	if err != nil {
+		return 0, nil, fmt.Errorf("delete items: %w", err)
+	}
+
+	affected, err := delRes.RowsAffected()
+	if err != nil {
+		return 0, nil, err
+	}
+
+	// 4. Prune very old tombstones (> 90 days) during purge
+	cutoff := now - 90*86400
+	_, _ = tx.Exec("DELETE FROM purged_items WHERE user_id = :user_id AND purged_at < :cutoff",
+		sql.Named("user_id", userID), sql.Named("cutoff", cutoff))
+
+	if err := tx.Commit(); err != nil {
+		return 0, nil, err
+	}
+
+	return affected, purged, nil
 }

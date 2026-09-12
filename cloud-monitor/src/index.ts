@@ -115,6 +115,7 @@ app.get("/health", async (c) => {
     const activeFeedCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM cloud_feeds WHERE is_active = 1").first<{ cnt: number }>();
     const itemCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt, MAX(id) as max_id, MAX(created_at) as max_created FROM cloud_feed_items").first<{ cnt: number; max_id: number; max_created: number }>();
     const oldestFeed = await c.env.DB.prepare("SELECT MIN(last_checked_at) as min_checked FROM cloud_feeds WHERE is_active = 1").first<{ min_checked: number }>();
+    const purgedCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM cloud_purged_items").first<{ cnt: number }>();
 
     return c.json({
       status: "ok",
@@ -125,6 +126,7 @@ app.get("/health", async (c) => {
       feeds_count: feedCount?.cnt ?? 0,
       active_feeds_count: activeFeedCount?.cnt ?? 0,
       feed_items_count: itemCount?.cnt ?? 0,
+      purged_items_count: purgedCount?.cnt ?? 0,
       latest_feed_item_id: itemCount?.max_id ?? 0,
       latest_feed_item_at: itemCount?.max_created ?? 0,
       oldest_feed_checked_at: oldestFeed?.min_checked ?? 0,
@@ -322,6 +324,71 @@ app.get("/api/sync/feeds/pull", async (c) => {
   });
 });
 
+// Purge read items from Cloudflare edge buffer and record tombstones
+app.post("/api/sync/feeds/purge", async (c) => {
+  const body = await c.req.json<{
+    feed_id?: number;
+    feed_ids?: number[];
+    items?: Array<{ feed_id: number; guid: string }>;
+    purge_all?: boolean;
+  }>();
+
+  const now = Math.floor(Date.now() / 1000);
+  const items = body.items || [];
+  let tombstoneCount = 0;
+
+  if (items.length > 0) {
+    const byFeed = new Map<number, string[]>();
+    const insertStmts: D1PreparedStatement[] = [];
+
+    for (const item of items) {
+      if (!item.feed_id || !item.guid) continue;
+
+      const list = byFeed.get(item.feed_id) || [];
+      list.push(item.guid);
+      byFeed.set(item.feed_id, list);
+
+      insertStmts.push(
+        c.env.DB.prepare(`
+          INSERT INTO cloud_purged_items (user_id, feed_id, guid, purged_at)
+          VALUES (1, ?, ?, ?)
+          ON CONFLICT(user_id, feed_id, guid) DO NOTHING
+        `).bind(item.feed_id, item.guid, now)
+      );
+    }
+
+    const deleteStmts: D1PreparedStatement[] = [];
+    for (const [feedId, guids] of byFeed.entries()) {
+      const chunkSize = 50;
+      for (let i = 0; i < guids.length; i += chunkSize) {
+        const chunk = guids.slice(i, i + chunkSize);
+        const placeholders = chunk.map(() => "?").join(",");
+        deleteStmts.push(
+          c.env.DB.prepare(
+            `DELETE FROM cloud_feed_items WHERE user_id = 1 AND feed_id = ? AND guid IN (${placeholders})`
+          ).bind(feedId, ...chunk)
+        );
+      }
+    }
+
+    const allStmts = [...insertStmts, ...deleteStmts];
+    const batchSize = 50;
+    for (let i = 0; i < allStmts.length; i += batchSize) {
+      const chunk = allStmts.slice(i, i + batchSize);
+      await c.env.DB.batch(chunk);
+    }
+
+    tombstoneCount = insertStmts.length;
+  }
+
+  return c.json({
+    status: "ok",
+    purged_items_count: items.length,
+    tombstones_recorded: tombstoneCount,
+    timestamp: now,
+  });
+});
+
 // Manual cron trigger for testing and administrative diagnostics
 app.all("/api/sync/cron/run", async (c) => {
   const start = Date.now();
@@ -474,7 +541,7 @@ async function fetchAndArchiveFeed(db: D1Database, feed: CloudFeedRow, now: numb
     // Limit to newest 40 items so giant feeds (e.g. 2,000 items) never blow memory or D1 limits
     const itemsToSave = items.slice(0, 40);
 
-    // Insert newly published items with ON CONFLICT DO NOTHING
+    // Insert newly published items with ON CONFLICT DO NOTHING, guarding against purged items
     const insertStmts: D1PreparedStatement[] = [];
     for (const item of itemsToSave) {
       const safeContent = item.content && item.content.length > 50000 ? item.content.slice(0, 50000) : (item.content || "");
@@ -482,7 +549,11 @@ async function fetchAndArchiveFeed(db: D1Database, feed: CloudFeedRow, now: numb
         db.prepare(`
           INSERT INTO cloud_feed_items (
             user_id, feed_id, guid, title, link, content, pub_date, created_at
-          ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+          )
+          SELECT 1, ?, ?, ?, ?, ?, ?, ?
+          WHERE NOT EXISTS (
+            SELECT 1 FROM cloud_purged_items WHERE user_id = 1 AND feed_id = ? AND guid = ?
+          )
           ON CONFLICT(user_id, feed_id, guid) DO NOTHING
         `).bind(
           feed.id,
@@ -491,7 +562,9 @@ async function fetchAndArchiveFeed(db: D1Database, feed: CloudFeedRow, now: numb
           item.link,
           safeContent,
           item.pubDate,
-          now
+          now,
+          feed.id,
+          item.guid
         )
       );
     }
@@ -524,6 +597,10 @@ async function pruneOldData(db: D1Database, now: number) {
     // Retain 14 days of buffered feed items
     const cutoff = now - 14 * 86400;
     await db.prepare("DELETE FROM cloud_feed_items WHERE created_at < ?").bind(cutoff).run();
+
+    // Retain 90 days of purged item tombstones
+    const tombstoneCutoff = now - 90 * 86400;
+    await db.prepare("DELETE FROM cloud_purged_items WHERE purged_at < ?").bind(tombstoneCutoff).run();
   } catch (err) {
     console.error("[Cron] Pruning error:", err);
   }

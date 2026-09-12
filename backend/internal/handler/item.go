@@ -3,6 +3,7 @@ package handler
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -210,10 +211,17 @@ func (h *Handler) purgeReadItems(c *gin.Context) {
 		}
 	}
 
-	_, err := h.store.DeleteReadItems(userID, req.FeedID, req.GroupID)
+	_, purgedItems, err := h.store.DeleteReadItems(userID, req.FeedID, req.GroupID)
 	if err != nil {
 		internalError(c, err, "purge read items")
 		return
+	}
+
+	// Synchronously notify Cloudflare edge worker to delete matching items from D1
+	if h.puller != nil && h.puller.GetCloudFeedSync() != nil && h.puller.GetCloudFeedSync().IsEnabled() {
+		if err := h.puller.GetCloudFeedSync().PurgeCloudFeedItems(c.Request.Context(), userID, req.FeedID, req.GroupID, purgedItems); err != nil {
+			slog.Warn("failed to purge items on cloud monitor", "error", err)
+		}
 	}
 
 	c.Status(http.StatusNoContent)

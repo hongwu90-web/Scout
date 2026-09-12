@@ -614,3 +614,66 @@ func TestMarkItemsReadByDate(t *testing.T) {
 		t.Fatalf("expected unread item to be guid-3, got %s", unreadItems[0].GUID)
 	}
 }
+
+func TestDeleteReadItems_PreventsReingestion(t *testing.T) {
+	store, _ := setupTestDB(t)
+	defer closeStore(t, store)
+
+	group := mustCreateGroup(t, store, "Test Group")
+	feed := mustCreateFeed(t, store, group.ID, "Test Feed", "https://example.com/feed", "https://example.com", "")
+
+	// Create 2 items
+	item1 := mustCreateItem(t, store, feed.ID, "item-1", "Article 1", "https://example.com/1", "Content 1", 100)
+	mustCreateItem(t, store, feed.ID, "item-2", "Article 2", "https://example.com/2", "Content 2", 200)
+
+	// Mark item1 as read
+	if err := store.UpdateItemUnread(1, item1.ID, false); err != nil {
+		t.Fatalf("UpdateItemUnread failed: %v", err)
+	}
+
+	// Purge read items
+	affected, purged, err := store.DeleteReadItems(1, &feed.ID, nil)
+	if err != nil {
+		t.Fatalf("DeleteReadItems failed: %v", err)
+	}
+	if affected != 1 || len(purged) != 1 {
+		t.Fatalf("expected 1 affected and 1 purged record, got %d, %d", affected, len(purged))
+	}
+	if purged[0].GUID != "item-1" {
+		t.Fatalf("expected purged guid to be item-1, got %s", purged[0].GUID)
+	}
+
+	// Verify item1 is deleted from items table
+	_, err = store.GetItem(1, item1.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected item1 to be deleted from items, got err: %v", err)
+	}
+
+	// Simulate re-fetching the feed: the feed contains item-1 (purged) and item-3 (new)
+	inputs := []BatchCreateItemInput{
+		{GUID: "item-1", Title: "Article 1", Link: "https://example.com/1", Content: "Content 1", PubDate: 100},
+		{GUID: "item-3", Title: "Article 3", Link: "https://example.com/3", Content: "Content 3", PubDate: 300},
+	}
+
+	newCount, err := store.BatchCreateItemsIgnore(1, feed.ID, inputs)
+	if err != nil {
+		t.Fatalf("BatchCreateItemsIgnore failed: %v", err)
+	}
+
+	// Only item-3 should have been inserted! item-1 MUST be rejected because it was purged!
+	if newCount != 1 {
+		t.Fatalf("expected exactly 1 newly inserted item (item-3), got %d", newCount)
+	}
+
+	// Verify item-1 is still NOT in the items table
+	items, err := store.ListItems(1, ListItemsParams{FeedID: &feed.ID})
+	if err != nil {
+		t.Fatalf("ListItems failed: %v", err)
+	}
+	for _, it := range items {
+		if it.GUID == "item-1" {
+			t.Fatalf("CRITICAL ERROR: purged item-1 was re-ingested into items table!")
+		}
+	}
+}
+

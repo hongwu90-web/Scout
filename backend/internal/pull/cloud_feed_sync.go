@@ -245,3 +245,68 @@ func (c *CloudFeedSync) FullSync(ctx context.Context, userID int64) (int, error)
 
 	return c.PullOfflineFeedItems(ctx, userID)
 }
+
+type cloudFeedPurgePayload struct {
+	FeedID   *int64                   `json:"feed_id,omitempty"`
+	FeedIDs  []int64                  `json:"feed_ids,omitempty"`
+	Items    []store.PurgedItemRecord `json:"items,omitempty"`
+	PurgeAll bool                     `json:"purge_all,omitempty"`
+}
+
+// PurgeCloudFeedItems instructs the Cloudflare edge worker to delete purged items from D1 and record tombstones.
+func (c *CloudFeedSync) PurgeCloudFeedItems(ctx context.Context, userID int64, feedID *int64, groupID *int64, purgedItems []store.PurgedItemRecord) error {
+	if !c.IsEnabled() {
+		return nil
+	}
+
+	payload := cloudFeedPurgePayload{
+		FeedID: feedID,
+		Items:  purgedItems,
+	}
+
+	if feedID == nil && groupID == nil {
+		payload.PurgeAll = true
+	} else if groupID != nil {
+		feeds, err := c.store.ListFeeds(userID)
+		if err == nil {
+			var ids []int64
+			for _, f := range feeds {
+				if f.GroupID == *groupID {
+					ids = append(ids, f.ID)
+				}
+			}
+			payload.FeedIDs = ids
+		}
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal purge payload: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/api/sync/feeds/purge", c.cfg.CloudMonitorURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("create purge request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if c.cfg.CloudMonitorSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.CloudMonitorSecret)
+		req.Header.Set("X-Scout-Sync-Key", c.cfg.CloudMonitorSecret)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("dispatch purge to cloud: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("cloud purge returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	slog.Info("purged read items successfully synchronized to cloud monitor", "items_count", len(purgedItems), "purge_all", payload.PurgeAll)
+	return nil
+}
